@@ -1,7 +1,7 @@
-# NGCCache (Pure Go)
+# NGCCache (Pure Go Edition)
 
 <div align="center">
-  <p><strong>A blazing fast, zero-GC, off-heap arena cache for Go.</strong></p>
+  <p><strong>A blazing fast, Zero-GC, Off-Heap KVS for Go.</strong></p>
 
   [![Go Reference](https://pkg.go.dev/badge/github.com/nuentel-cat/NGCCache.svg)](https://pkg.go.dev/github.com/nuentel-cat/NGCCache)
   [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
@@ -9,121 +9,126 @@
 
 <br />
 
-NGCCache is a high-performance, Pure Go off-heap memory cache library designed to completely bypass Go's Garbage Collection (GC) overhead. It uses `syscall.Mmap` (or `VirtualAlloc` on Windows) to manage memory outside of Go's runtime, making it ideal for storing massive numbers of entries without causing GC-related latency spikes.
+NGCCache is a high-performance, **Pure Go** off-heap memory cache library. By managing memory directly via OS system calls (`mmap` on Unix, `VirtualAlloc` on Windows), it completely bypasses Go's Garbage Collection (GC) overhead. 
 
-## 🚀 Core Concepts
+It is specifically engineered for **"Write-Once, Read-Many"** workloads in massive-traffic environments such as Ad-Tech, Gaming backends, and High-Frequency Trading systems where even micro-second latency spikes from GC (Stop-The-World) are unacceptable.
 
-- **Zero-GC & Off-Heap**: All cache data and index structures are stored in memory allocated directly from the OS, making them invisible to Go's GC.
-- **Goroutine-Scoped Arena**: Caches can be tied to a goroutine's lifecycle. When the goroutine ends, all memory used in that session is instantly recycled in O(1) time.
-- **Deterministic Memory**: Configure the cache by the number of keys and a fixed value size, leading to predictable memory usage.
-- **Read-Optimized for High Throughput**: Specialized features like `SetReadOnly` mode provide lock-free, ultra-fast reads for "write-once, read-many" workloads.
+---
+
+## 🚀 Why NGCCache?
+
+- **Zero GC Overhead**: Both data values and index structures (hash tables) are stored off-heap. GC scan time remains constant regardless of whether you have 100 or 100 million entries.
+- **Pure Go Integration**: No Cgo required. Easy cross-compilation, faster builds, and better security.
+- **Goroutine-Scoped Arena**: Bind caches to a request's lifecycle. When the goroutine ends, all its memory is recycled in O(1) time.
+- **The "InnoDB" of In-Memory**: Optimized for read-intensive workloads with advanced tuning options like `SetReadOnly` and `GetUnsafe`.
+
+---
+
+## 🔧 Installation
+
+```bash
+go get github.com/nuentel-cat/NGCCache
+```
 
 ---
 
 ## 🔧 Configuration
 
-The `Config` struct allows for clear, intention-driven setup.
+Configuring NGCCache is intuitive and intention-driven. You define the capacity by the number of keys.
 
 ```go
 type Config struct {
-    // --- Goroutine-Scoped (Local) Cache ---
-    // The maximum number of keys that can be stored across ALL active sessions.
-    LocalCacheMaxKeys uint64
-
-    // --- Global Shared Cache ---
-    // The maximum number of keys for the global, shared cache.
-    SharedCacheMaxKeys uint64
-
-    // --- Overall Cache Sizing ---
-    // The default maximum size for a single value (in bytes).
-    // This determines the slab size and affects memory usage.
-    MaxValueSize uint64
-
-    // Verbose logging on startup.
-    Verbose bool
+    LocalCacheMaxKeys  uint64 // Max keys for request-scoped (local) sessions
+    SharedCacheMaxKeys uint64 // Max keys for the global shared cache
+    MaxValueSize       uint64 // Max data size per key (in bytes)
+    Verbose            bool   // detailed memory breakdown on startup
 }
 ```
 
-### Example
-
+### Initialization Example
 ```go
+import "github.com/nuentel-cat/NGCCache"
+
 cache, err := ngccache.NewCache(ngccache.Config{
-    // A pool for 1 million session-scoped items.
     LocalCacheMaxKeys:  1000000,
-    // A global cache for 50,000 master data items.
     SharedCacheMaxKeys: 50000,
-    // Each item can be up to 4KB.
-    MaxValueSize:       4 * 1024,
-    // Print memory layout on startup.
-    Verbose:      true,
+    MaxValueSize:       4096, // 4KB
+    Verbose:            true,
 })
+defer cache.Close() // Essential for freeing OS memory
 ```
 
 ---
 
-## ⚡️ API and Usage
+## ⚡️ API Reference
 
-### Basic Usage (Session Cache)
-```go
-// Inside a goroutine for a request
-sessionID, endSession := cache.BeginSession()
-defer endSession()
+### Session Cache (Local)
+Create a session to track and instantly recycle memory at the end of a request.
+- `BeginSession() (sessionID uint64, endSession func())`
+- `Set(sid uint64, key string, data []byte) error`
+- `Get(sid uint64, key string) ([]byte, bool)`
+- `Delete(sid uint64, key string) bool`
+- `Exist(sid uint64, key string) bool`
+- `Add(sid uint64, key string, data []byte) error` (Sets only if key is missing)
+- `Increment(sid uint64, key string, delta int64) (int64, error)` (Atomic)
+- `Decrement(sid uint64, key string, delta int64) (int64, error)` (Atomic)
 
-cache.Set(sessionID, "request_specific_key", []byte("some data"))
-val, found := cache.Get(sessionID, "request_specific_key")
-```
-
-### Shared Cache
-```go
-// At startup
-cache.SetShared("master_data_1", []byte("..."))
-
-// In any goroutine
-val, found := cache.GetShared("master_data_1")
-```
-
----
-
-## 🚀 Advanced Performance Tuning
-
-### `SetReadOnly()` Mode
-For "write-once, read-many" scenarios, you can dramatically improve read performance by disabling writes.
-
-```go
-// 1. Populate the shared cache at startup
-for _, item := range masterData {
-    cache.SetShared(item.Key, item.Value)
-}
-
-// 2. Transition to read-only mode
-cache.SetReadOnly()
-
-// 3. All subsequent GetShared calls are now lock-free and extremely fast
-val, found := cache.GetShared("some_master_key")
-```
-
-### `GetUnsafe()` - Zero-Copy Reads
-For the absolute lowest latency, `GetUnsafe` returns a slice that points directly to the off-heap memory, avoiding a data copy.
-
-**WARNING**: This is an advanced feature. The returned slice is only valid as long as the key is not deleted and the session has not ended. Use with extreme caution.
-
-```go
-// This operation has almost zero overhead
-val, found := cache.GetSharedUnsafe("some_key")
-if found {
-    // Do NOT store `val` or pass it to other goroutines.
-    // Use it immediately and discard.
-    fmt.Printf("Read %d bytes without copying", len(val))
-}
-```
+### Shared Cache (Global)
+Persistent cache accessible across all goroutines.
+- `SetShared(key string, data []byte) error`
+- `GetShared(key string) ([]byte, bool)`
+- `DeleteShared(key string) bool`
+- `ExistShared(key string) bool`
+- `IncrementShared(key string, delta int64) (int64, error)`
+- `DecrementShared(key string, delta int64) (int64, error)`
 
 ---
 
-## 📊 Benchmarks (vs. freecache)
-`NGCCache` excels in read-intensive workloads, especially when `SetReadOnly` can be used.
+## 🚀 Extreme Performance Tuning
 
-| Benchmark | **NGCCache (ReadOnly)** | **NGCCache (Unsafe)** | **freecache** |
-|:---|:---:|:---:|:---:|
-| Shared Read | **26 ns/op** | **15 ns/op** | 33 ns/op |
+### 1. `SetReadOnly()` - Lock-Free Reads
+Call `cache.SetReadOnly()` after pre-loading your master data. This makes `GetShared` operations **lock-free** and eliminates atomic memory barriers, reaching speeds of **~26 ns/op**.
+*Note: Any subsequent writes will return `ErrReadOnly`.*
 
-In scenarios with heavy concurrent writes (`Concurrent Mixed`), `freecache`'s architecture currently gives it an edge. `NGCCache` is specialized for read-heavy workloads where predictable low latency and zero GC impact are critical.
+### 2. `GetUnsafe()` - Zero-Copy Reference
+For ultimate speed, use `GetUnsafe(sid, key)` or `GetSharedUnsafe(key)`. This returns a `[]byte` pointing **directly to off-heap memory** (approx **15 ns/op**).
+- **CRITICAL**: The slice is only valid until the key is modified/deleted or the session ends.
+- **DO NOT** modify, append to, or store this slice. Use it for immediate read-only processing.
+
+---
+
+## ❌ Error Handling
+
+NGCCache uses explicit errors for predictable behavior:
+- `ErrOffHeapOutOfMemory`: The allocated pool for keys is exhausted.
+- `ErrDataTooLarge`: Provided data exceeds the configured `MaxValueSize`.
+- `ErrInvalidSession`: Operating on a session that has already ended.
+- `ErrCacheAlreadyExists`: Returned by `Add` when the key exists.
+- `ErrReadOnly`: Attempting to write to a cache in ReadOnly mode.
+
+---
+
+## 📊 Benchmarks (Shared Read)
+
+NGCCache is optimized for extreme read-heavy scenarios, significantly outperforming other popular Go caching libraries.
+
+Tested on Intel Core i9-14900HX:
+
+| Engine | Strategy | Performance |
+|:---|:---|:---:|
+| **NGCCache** | **ReadOnly (Safe)** | **26 ns/op** |
+| **NGCCache** | **Unsafe (Zero-Copy)** | **15 ns/op** |
+| Other High-Perf Cache | Default | ~33 ns/op |
+
+In scenarios with heavy concurrent writes, universal general-purpose caches might have an edge. NGCCache is specialized for read-heavy workloads where predictable low latency and zero GC impact are critical.
+
+---
+
+## 💻 Platform Support
+- **Linux / macOS**: via `syscall.Mmap`
+- **Windows**: via `syscall.VirtualAlloc`
+
+---
+
+## 📄 License
+NGCCache is released under the **Apache License 2.0**. See [LICENSE](LICENSE) for details.
